@@ -97,6 +97,31 @@ def _litellm_cost(
         return None
 
 
+def _litellm_total_cost(
+    model: str,
+    *,
+    prompt_tokens: int,
+    completion_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float | None:
+    """Compute total provider cost via LiteLLM, including output tokens."""
+    if not _LITELLM_AVAILABLE:
+        return None
+    resolved = resolve_litellm_model(model)
+    try:
+        input_cost, output_cost = _litellm.cost_per_token(
+            model=resolved,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cache_read_input_tokens=cache_read_tokens,
+            cache_creation_input_tokens=cache_write_tokens,
+        )
+        return float(input_cost + output_cost)
+    except Exception:
+        return None
+
+
 def _get_list_price(model: str) -> float | None:
     """Get list input price per 1M tokens."""
     if not _LITELLM_AVAILABLE:
@@ -134,6 +159,15 @@ def _parse_kv(kv_str: str) -> dict[str, str]:
     return result
 
 
+def _optional_int(value: str | None) -> int | None:
+    if value is None or value in ("", "na", "none", "null", "-"):
+        return None
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        return None
+
+
 @dataclass
 class PerfRecord:
     """A single parsed PERF log entry."""
@@ -153,6 +187,10 @@ class PerfRecord:
     transforms: list[str] = field(default_factory=list)
     total_ms: float = 0.0
     tokens_out: int = 0
+    provider_input_tokens_actual: int | None = None
+    provider_output_tokens_actual: int | None = None
+    provider_cached_tokens_actual: int | None = None
+    provider_cache_write_tokens_actual: int | None = None
     ttfb_ms: float = 0.0
     stages: dict[str, float] = field(default_factory=dict)
 
@@ -344,6 +382,18 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                                 transforms=transforms,
                                 total_ms=float(kv.get("total_ms", 0)),
                                 tokens_out=int(kv.get("tok_out", 0)),
+                                provider_input_tokens_actual=_optional_int(
+                                    kv.get("provider_input")
+                                ),
+                                provider_output_tokens_actual=_optional_int(
+                                    kv.get("provider_output")
+                                ),
+                                provider_cached_tokens_actual=_optional_int(
+                                    kv.get("provider_cache_read")
+                                ),
+                                provider_cache_write_tokens_actual=_optional_int(
+                                    kv.get("provider_cache_write")
+                                ),
                                 ttfb_ms=float(kv.get("ttfb_ms", 0)),
                                 stages=stages_by_rid.get(m.group("rid"), {}),
                             )
@@ -495,6 +545,45 @@ def format_report(report: PerfReport) -> str:
         impossible_count = audit["record_counts"]["logged_saved_gt_tokens_before"]
         if impossible_count:
             lines.append(f"  Impossible records:   {impossible_count} saved more than before")
+        lines.append("")
+
+        provider_usage = build_provider_usage_summary(report)
+        lines.append("Actual Provider Usage")
+        lines.append("-" * 40)
+        if provider_usage["available"]:
+            lines.append(
+                "  Input:       "
+                f"{provider_usage['input_tokens_actual']:,}"
+                if provider_usage["input_tokens_actual"] is not None
+                else "  Input:       unavailable"
+            )
+            lines.append(
+                "  Output:      "
+                f"{provider_usage['output_tokens_actual']:,}"
+                if provider_usage["output_tokens_actual"] is not None
+                else "  Output:      unavailable"
+            )
+            lines.append(
+                "  Cached read: "
+                f"{provider_usage['cached_tokens_actual']:,}"
+                if provider_usage["cached_tokens_actual"] is not None
+                else "  Cached read: unavailable"
+            )
+            lines.append(
+                "  Records:     "
+                f"{provider_usage['records_with_provider_usage']}/{len(records)} "
+                "with provider usage"
+            )
+            cost = provider_usage["cost"]
+            if cost["actual_with_headroom_usd"] is not None:
+                lines.append(
+                    "  Cost:        "
+                    f"actual ${cost['actual_with_headroom_usd']:.4f}, "
+                    f"estimated without ${cost['estimated_without_headroom_usd']:.4f}, "
+                    f"savings ${cost['estimated_savings_usd']:.4f}"
+                )
+        else:
+            lines.append("  unavailable (provider usage metadata was not captured)")
         lines.append("")
 
         # Per-model breakdown with list prices
@@ -742,6 +831,10 @@ PERF_RECORD_FIELDS = [
     "transforms",
     "total_ms",
     "tokens_out",
+    "provider_input_tokens_actual",
+    "provider_output_tokens_actual",
+    "provider_cached_tokens_actual",
+    "provider_cache_write_tokens_actual",
     "ttfb_ms",
     "stages",
 ]
@@ -849,6 +942,77 @@ def build_savings_audit(report: PerfReport, *, limit: int = 10) -> dict:
             for r in sorted(records, key=lambda rec: rec.tokens_saved, reverse=True)[:limit]
         ],
         "suspicious_records": suspicious_records,
+    }
+
+
+def build_provider_usage_summary(report: PerfReport) -> dict:
+    """Aggregate provider-observed usage, separate from counterfactual estimates."""
+    records = report.perf_records
+    available = [
+        r
+        for r in records
+        if any(
+            value is not None
+            for value in (
+                r.provider_input_tokens_actual,
+                r.provider_output_tokens_actual,
+                r.provider_cached_tokens_actual,
+                r.provider_cache_write_tokens_actual,
+            )
+        )
+    ]
+
+    def _sum(field: str) -> int | None:
+        values = [getattr(r, field) for r in available if getattr(r, field) is not None]
+        return sum(values) if values else None
+
+    actual_cost = 0.0
+    estimated_without_cost = 0.0
+    cost_records = 0
+    for record in available:
+        if (
+            record.provider_input_tokens_actual is None
+            or record.provider_output_tokens_actual is None
+        ):
+            continue
+        with_headroom = _litellm_total_cost(
+            record.model,
+            prompt_tokens=record.provider_input_tokens_actual,
+            completion_tokens=record.provider_output_tokens_actual,
+            cache_read_tokens=record.provider_cached_tokens_actual or 0,
+            cache_write_tokens=record.provider_cache_write_tokens_actual or 0,
+        )
+        without_headroom = _litellm_total_cost(
+            record.model,
+            prompt_tokens=record.tokens_before,
+            completion_tokens=record.provider_output_tokens_actual,
+        )
+        if with_headroom is None or without_headroom is None:
+            continue
+        actual_cost += with_headroom
+        estimated_without_cost += without_headroom
+        cost_records += 1
+
+    cost_payload = {
+        "actual_with_headroom_usd": round(actual_cost, 6) if cost_records else None,
+        "estimated_without_headroom_usd": round(estimated_without_cost, 6)
+        if cost_records
+        else None,
+        "estimated_savings_usd": round(estimated_without_cost - actual_cost, 6)
+        if cost_records
+        else None,
+        "records_with_cost": cost_records,
+    }
+
+    return {
+        "available": bool(available),
+        "records_with_provider_usage": len(available),
+        "records_without_provider_usage": len(records) - len(available),
+        "input_tokens_actual": _sum("provider_input_tokens_actual"),
+        "output_tokens_actual": _sum("provider_output_tokens_actual"),
+        "cached_tokens_actual": _sum("provider_cached_tokens_actual"),
+        "cache_write_tokens_actual": _sum("provider_cache_write_tokens_actual"),
+        "cost": cost_payload,
     }
 
 
@@ -1154,6 +1318,7 @@ def build_perf_summary(report: PerfReport) -> dict:
             4,
         ),
         "savings_audit": savings_audit,
+        "actual_provider_usage": build_provider_usage_summary(report),
         "cache_read_tokens": total_cr,
         "cache_write_tokens": total_cw,
         "cache_hit_pct": cache_hit_pct,

@@ -44,6 +44,9 @@ def _sample_report() -> PerfReport:
                 cache_hit_pct=80,
                 optimization_ms=12.0,
                 transforms=["content_router"],
+                provider_input_tokens_actual=410,
+                provider_output_tokens_actual=50,
+                provider_cached_tokens_actual=80,
             ),
             PerfRecord(
                 timestamp="2026-06-05 11:00:00,000",
@@ -98,6 +101,15 @@ def test_build_perf_summary_totals_and_pct():
     assert summary["window_hours"] == 24.0
     assert summary["savings_audit"]["prompt_reduction_tokens"] == 1000
     assert summary["savings_audit"]["accounting_delta_tokens"] == 0
+    provider_usage = summary["actual_provider_usage"]
+    assert provider_usage["available"] is True
+    assert provider_usage["records_with_provider_usage"] == 1
+    assert provider_usage["records_without_provider_usage"] == 1
+    assert provider_usage["input_tokens_actual"] == 410
+    assert provider_usage["output_tokens_actual"] == 50
+    assert provider_usage["cached_tokens_actual"] == 80
+    assert provider_usage["cache_write_tokens_actual"] is None
+    assert "actual_with_headroom_usd" in provider_usage["cost"]
 
 
 def test_build_perf_summary_by_model_and_transform():
@@ -121,6 +133,7 @@ def test_build_perf_summary_empty_report_no_zero_division():
     assert summary["cache_hit_pct"] == 0.0
     assert summary["by_model"] == []
     assert summary["overhead"]["optimization_ms"]["count"] == 0
+    assert summary["actual_provider_usage"]["available"] is False
 
 
 def test_build_overhead_summary_attributes_slow_stages():
@@ -324,6 +337,34 @@ def test_parse_perf_line_preserves_blank_client_field(
 
     assert len(report.perf_records) == 1
     assert report.perf_records[0].client == ""
+
+
+def test_parse_perf_line_preserves_provider_usage_fields(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    monkeypatch.setattr(analyzer, "LOG_DIR", logs_dir)
+    (logs_dir / "proxy.log").write_text(
+        "2026-06-10 10:00:00,000 - headroom.proxy - INFO - [req-usage] PERF "
+        "model=gpt-5 msgs=1 tok_before=1000 tok_after=50 tok_saved=950 "
+        "cache_read=0 cache_write=0 cache_hit_pct=0 opt_ms=1 total_ms=10 tok_out=0 "
+        "provider_input=55 provider_output=12 provider_cache_read=40 "
+        "provider_cache_write=na ttfb_ms=0 transforms=test client=codex\n",
+        encoding="utf-8",
+    )
+
+    report = analyzer.parse_log_files(last_n_hours=0)
+
+    assert len(report.perf_records) == 1
+    rec = report.perf_records[0]
+    assert rec.provider_input_tokens_actual == 55
+    assert rec.provider_output_tokens_actual == 12
+    assert rec.provider_cached_tokens_actual == 40
+    assert rec.provider_cache_write_tokens_actual is None
+    assert analyzer.build_perf_summary(report)["actual_provider_usage"][
+        "input_tokens_actual"
+    ] == 55
 
 
 def test_throughput_parsing_and_calculations(monkeypatch, tmp_path):

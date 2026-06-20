@@ -2687,6 +2687,16 @@ class OpenAIHandlerMixin:
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         uncached_input_tokens=uncached_input_tokens,
+                        provider_input_tokens_actual=total_input_tokens
+                        if total_input_tokens > 0
+                        else None,
+                        provider_output_tokens_actual=output_tokens
+                        if output_tokens > 0
+                        else None,
+                        provider_cached_tokens_actual=cache_read_tokens
+                        if cache_read_tokens > 0
+                        else None,
+                        provider_cache_write_tokens_actual=None,
                         total_latency_ms=total_latency,
                         overhead_ms=optimization_latency,
                         pipeline_timing=pipeline_timing,

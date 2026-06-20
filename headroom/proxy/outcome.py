@@ -80,6 +80,14 @@ class RequestOutcome:
     cache_write_1h_tokens: int = 0
     uncached_input_tokens: int = 0
     cache_inferred: bool = False
+    # Provider-observed usage, populated only when the upstream response
+    # includes usage metadata. These are deliberately separate from
+    # original_tokens/optimized_tokens/tokens_saved, which are Headroom's
+    # estimated counterfactual accounting.
+    provider_input_tokens_actual: int | None = None
+    provider_output_tokens_actual: int | None = None
+    provider_cached_tokens_actual: int | None = None
+    provider_cache_write_tokens_actual: int | None = None
     # Response-cache hit (Headroom's own semantic cache served the
     # response from a prior call — completely distinct from
     # upstream-prompt-cache `cache_read_tokens`). True means the proxy
@@ -426,6 +434,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    line unchanged, and gives ``headroom perf --client X``
     #    parsers a clean key to filter on.
     client_part = f" client={outcome.client}" if outcome.client else ""
+
+    def _perf_optional_int(value: int | None) -> str:
+        return "na" if value is None else str(value)
+
     logger.info(
         f"[{outcome.request_id}] PERF "
         f"model={outcome.model} msgs={outcome.num_messages} "
@@ -436,6 +448,10 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"opt_ms={outcome.overhead_ms:.0f} "
         f"total_ms={outcome.total_latency_ms:.0f} "
         f"tok_out={outcome.output_tokens} "
+        f"provider_input={_perf_optional_int(outcome.provider_input_tokens_actual)} "
+        f"provider_output={_perf_optional_int(outcome.provider_output_tokens_actual)} "
+        f"provider_cache_read={_perf_optional_int(outcome.provider_cached_tokens_actual)} "
+        f"provider_cache_write={_perf_optional_int(outcome.provider_cache_write_tokens_actual)} "
         f"ttfb_ms={outcome.ttfb_ms:.0f} "
         f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
         f"{client_part}"
