@@ -13,9 +13,13 @@ from headroom.proxy.output_shaper import (
     LEGACY_THINKING_FLOOR,
     OutputShaperSettings,
     TurnKind,
+    apply_openai_verbosity_steering,
     apply_verbosity_steering,
+    classify_openai_turn,
     classify_turn,
+    route_openai_effort,
     route_effort,
+    shape_openai_request,
     shape_request,
     steering_text,
 )
@@ -282,3 +286,112 @@ class TestShapeRequest:
         settings = OutputShaperSettings.from_env()
         assert settings.verbosity_level == 4
         assert settings.mechanical_effort == "low"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI / Codex shaping
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAIOutputShaper:
+    def test_responses_instructions_get_steering(self):
+        body = {"instructions": "Be helpful.", "input": "hello"}
+
+        assert apply_openai_verbosity_steering(body, 4) is True
+
+        assert body["instructions"].startswith("Be helpful.")
+        assert steering_text(4) in body["instructions"]
+
+    def test_responses_steering_is_idempotent(self):
+        body = {"instructions": "Be helpful.", "input": "hello"}
+        assert apply_openai_verbosity_steering(body, 3) is True
+        snapshot = copy.deepcopy(body)
+
+        assert apply_openai_verbosity_steering(body, 3) is False
+        assert body == snapshot
+
+    def test_chat_inserts_system_when_missing(self):
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+
+        assert apply_openai_verbosity_steering(body, 2) is True
+
+        assert body["messages"][0] == {"role": "system", "content": steering_text(2)}
+
+    def test_chat_appends_to_existing_developer_message(self):
+        body = {
+            "messages": [
+                {"role": "developer", "content": "Follow project rules."},
+                {"role": "user", "content": "hello"},
+            ]
+        }
+
+        assert apply_openai_verbosity_steering(body, 4) is True
+
+        assert body["messages"][0]["content"].startswith("Follow project rules.")
+        assert steering_text(4) in body["messages"][0]["content"]
+
+    def test_responses_function_call_output_is_mechanical(self):
+        body = {"input": [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}]}
+
+        assert classify_openai_turn(body) == TurnKind.MECHANICAL_CONTINUATION
+
+    def test_responses_user_message_is_new_ask(self):
+        body = {"input": [{"role": "user", "content": [{"type": "input_text", "text": "fix it"}]}]}
+
+        assert classify_openai_turn(body) == TurnKind.NEW_USER_ASK
+
+    def test_responses_assistant_history_does_not_hide_tool_continuation(self):
+        body = {
+            "input": [
+                {"type": "message", "role": "assistant", "content": "calling tool"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+            ]
+        }
+
+        assert classify_openai_turn(body) == TurnKind.MECHANICAL_CONTINUATION
+
+    def test_openai_reasoning_effort_lowered_on_mechanical_turn(self):
+        body = {"reasoning": {"effort": "high"}}
+
+        labels = route_openai_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
+
+        assert body["reasoning"]["effort"] == "low"
+        assert labels == ["output_shaper:openai_reasoning_effort:high->low"]
+
+    def test_openai_reasoning_effort_kept_on_new_ask(self):
+        body = {"reasoning": {"effort": "high"}}
+
+        labels = route_openai_effort(body, TurnKind.NEW_USER_ASK, ENABLED)
+
+        assert body["reasoning"]["effort"] == "high"
+        assert labels == []
+
+    def test_shape_openai_request_handles_responses_end_to_end(self):
+        body = {
+            "instructions": "Be helpful.",
+            "input": [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}],
+            "reasoning": {"effort": "high"},
+        }
+
+        result = shape_openai_request(body, ENABLED, level_override=4)
+
+        assert result.changed is True
+        assert result.labels == [
+            "output_shaper:openai_verbosity:L4",
+            "output_shaper:openai_reasoning_effort:high->low",
+        ]
+        assert steering_text(4) in body["instructions"]
+        assert body["reasoning"]["effort"] == "low"
+
+    def test_shape_openai_request_disabled_is_noop(self):
+        body = {
+            "instructions": "Be helpful.",
+            "input": "hello",
+            "reasoning": {"effort": "high"},
+        }
+        snapshot = copy.deepcopy(body)
+
+        result = shape_openai_request(body, OutputShaperSettings(enabled=False))
+
+        assert result.changed is False
+        assert body == snapshot

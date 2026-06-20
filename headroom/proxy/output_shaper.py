@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 LEGACY_THINKING_FLOOR = 1024
 
 # Ordering for output_config.effort values. Unknown values are left alone.
-_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
+_EFFORT_RANK = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5}
 
 # Sentinel prefix marks the steering block so application is idempotent and
 # the block is recognizable in logs/diffs.
@@ -286,6 +286,165 @@ def apply_verbosity_steering(body: dict[str, Any], level: int) -> bool:
     return False
 
 
+def _append_or_replace_steering_text(value: str, text: str) -> tuple[str, bool]:
+    if _STEERING_SENTINEL not in value:
+        return f"{value}\n\n{text}" if value else text, True
+
+    before, sentinel, rest = value.partition(_STEERING_SENTINEL)
+    if not sentinel:
+        return f"{value}\n\n{text}" if value else text, True
+    _old_block, suffix, after = rest.partition(_STEERING_SUFFIX)
+    replacement = f"{before}{text}{after if suffix else ''}"
+    return replacement, replacement != value
+
+
+def _content_part_text(part: dict[str, Any]) -> str:
+    if isinstance(part.get("text"), str):
+        return part["text"]
+    if isinstance(part.get("content"), str):
+        return part["content"]
+    return ""
+
+
+def _append_steering_part(parts: list[Any], text: str) -> bool:
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        current = _content_part_text(part)
+        if current.startswith(_STEERING_SENTINEL):
+            if current == text:
+                return False
+            if "text" in part:
+                part["text"] = text
+            else:
+                part["content"] = text
+            return True
+    parts.append({"type": "text", "text": text})
+    return True
+
+
+def apply_openai_verbosity_steering(body: dict[str, Any], level: int) -> bool:
+    """Apply byte-stable verbosity steering to OpenAI chat/responses bodies."""
+    text = steering_text(level)
+    if text is None:
+        return False
+
+    # Responses API: instructions is the system/developer channel.
+    if "instructions" in body or "input" in body:
+        instructions = body.get("instructions")
+        if instructions is None:
+            body["instructions"] = text
+            return True
+        if isinstance(instructions, str):
+            updated, changed = _append_or_replace_steering_text(instructions, text)
+            if changed:
+                body["instructions"] = updated
+            return changed
+        return False
+
+    # Chat Completions: prefer an existing system/developer message, otherwise
+    # insert a system message at the front.
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in ("system", "developer"):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            updated, changed = _append_or_replace_steering_text(content, text)
+            if changed:
+                message["content"] = updated
+            return changed
+        if isinstance(content, list):
+            return _append_steering_part(content, text)
+        return False
+
+    messages.insert(0, {"role": "system", "content": text})
+    return True
+
+
+def classify_openai_turn(body: dict[str, Any]) -> TurnKind:
+    """Structurally classify OpenAI chat/responses bodies for effort routing."""
+    input_data = body.get("input")
+    if isinstance(input_data, str):
+        return TurnKind.NEW_USER_ASK if input_data.strip() else TurnKind.UNKNOWN
+    if isinstance(input_data, list) and input_data:
+        saw_tool_output = False
+        saw_error = False
+        for item in input_data:
+            if not isinstance(item, dict):
+                return TurnKind.UNKNOWN
+            item_type = item.get("type")
+            role = item.get("role")
+            if item_type == "function_call_output":
+                saw_tool_output = True
+                if item.get("status") in ("failed", "error") or item.get("is_error") is True:
+                    saw_error = True
+            elif role == "user" or item_type in ("input_text", "input_image", "input_file"):
+                return TurnKind.NEW_USER_ASK
+        if saw_error:
+            return TurnKind.ERROR_CONTINUATION
+        if saw_tool_output:
+            return TurnKind.MECHANICAL_CONTINUATION
+        return TurnKind.UNKNOWN
+
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return TurnKind.UNKNOWN
+    last = messages[-1]
+    if not isinstance(last, dict):
+        return TurnKind.UNKNOWN
+    role = last.get("role")
+    if role == "tool":
+        return TurnKind.ERROR_CONTINUATION if last.get("is_error") is True else TurnKind.MECHANICAL_CONTINUATION
+    if role == "user":
+        content = last.get("content")
+        if isinstance(content, str):
+            return TurnKind.NEW_USER_ASK if content.strip() else TurnKind.UNKNOWN
+        if isinstance(content, list) and content:
+            return TurnKind.NEW_USER_ASK
+    return TurnKind.UNKNOWN
+
+
+def route_openai_effort(
+    body: dict[str, Any],
+    kind: TurnKind,
+    settings: OutputShaperSettings,
+) -> list[str]:
+    """Lower existing OpenAI reasoning effort on mechanical continuations."""
+    if kind is not TurnKind.MECHANICAL_CONTINUATION:
+        return []
+
+    labels: list[str] = []
+    target = settings.mechanical_effort
+
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if (
+            isinstance(effort, str)
+            and effort in _EFFORT_RANK
+            and target in _EFFORT_RANK
+            and _EFFORT_RANK[effort] > _EFFORT_RANK[target]
+        ):
+            reasoning["effort"] = target
+            labels.append(f"output_shaper:openai_reasoning_effort:{effort}->{target}")
+
+    effort = body.get("reasoning_effort")
+    if (
+        isinstance(effort, str)
+        and effort in _EFFORT_RANK
+        and target in _EFFORT_RANK
+        and _EFFORT_RANK[effort] > _EFFORT_RANK[target]
+    ):
+        body["reasoning_effort"] = target
+        labels.append(f"output_shaper:openai_reasoning_effort:{effort}->{target}")
+
+    return labels
+
+
 def route_effort(
     body: dict[str, Any],
     kind: TurnKind,
@@ -356,5 +515,35 @@ def shape_request(
             result.changed = True
             result.labels.extend(labels)
         logger.debug("OutputShaper: turn=%s mutations=%s", kind.value, labels)
+
+    return result
+
+
+def shape_openai_request(
+    body: dict[str, Any],
+    settings: OutputShaperSettings | None = None,
+    level_override: int | None = None,
+) -> ShapeResult:
+    """Apply output shaping to OpenAI Chat Completions and Responses bodies."""
+    if settings is None:
+        settings = OutputShaperSettings.from_env()
+    result = ShapeResult()
+    if not settings.enabled:
+        return result
+
+    assert result.labels is not None
+
+    level = settings.verbosity_level if level_override is None else level_override
+    if level > 0 and apply_openai_verbosity_steering(body, level):
+        result.changed = True
+        result.labels.append(f"output_shaper:openai_verbosity:L{level}")
+
+    if settings.effort_router_enabled:
+        kind = classify_openai_turn(body)
+        labels = route_openai_effort(body, kind, settings)
+        if labels:
+            result.changed = True
+            result.labels.extend(labels)
+        logger.debug("OpenAI OutputShaper: turn=%s mutations=%s", kind.value, labels)
 
     return result

@@ -1541,6 +1541,30 @@ class OpenAIHandlerMixin:
         if input_event.tools is not None:
             body["tools"] = input_event.tools
 
+        if not self._headroom_bypass_enabled(request.headers):
+            from headroom.proxy.output_shaper import (
+                OutputShaperSettings,
+                resolve_verbosity_level,
+                shape_openai_request,
+            )
+
+            _shaper_settings = OutputShaperSettings.from_env()
+            if _shaper_settings.enabled:
+                _level, _level_source = resolve_verbosity_level(_shaper_settings)
+                _shape_result = shape_openai_request(
+                    body,
+                    _shaper_settings,
+                    level_override=_level,
+                )
+                if _shape_result.changed:
+                    messages = body.get("messages", messages)
+                    logger.info(
+                        "[%s] OpenAI OutputShaper: labels=%s level_source=%s",
+                        request_id,
+                        _shape_result.labels,
+                        _level_source,
+                    )
+
         # Validate message array size
         if len(messages) > MAX_MESSAGE_ARRAY_LENGTH:
             return JSONResponse(
@@ -2809,6 +2833,29 @@ class OpenAIHandlerMixin:
             body=body,
             metadata={"path": request.url.path, "stream": stream},
         )
+
+        if not _bypass:
+            from headroom.proxy.output_shaper import (
+                OutputShaperSettings,
+                resolve_verbosity_level,
+                shape_openai_request,
+            )
+
+            _shaper_settings = OutputShaperSettings.from_env()
+            if _shaper_settings.enabled:
+                _level, _level_source = resolve_verbosity_level(_shaper_settings)
+                _shape_result = shape_openai_request(
+                    body,
+                    _shaper_settings,
+                    level_override=_level,
+                )
+                if _shape_result.changed:
+                    logger.info(
+                        "[%s] OpenAI Responses OutputShaper: labels=%s level_source=%s",
+                        request_id,
+                        _shape_result.labels,
+                        _level_source,
+                    )
 
         # /v1/responses uses provider-specific CompressionUnit extraction
         # below, then routes mutable text through ContentRouter. The
